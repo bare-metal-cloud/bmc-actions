@@ -65418,8 +65418,9 @@ function stripTrailingSlash(url) {
 
 ;// CONCATENATED MODULE: ./shared/src/http.ts
 /**
- * Thin fetch wrapper: a timeout on every request and a small retry loop
- * ONLY where the protocol has an idempotent story.
+ * Thin fetch wrapper: a timeout on every request AND on every body
+ * read, a never-followed redirect policy, and a small retry loop ONLY
+ * where the protocol has an idempotent story.
  *
  * Retry law (verified against the backend handler, story B5.2):
  *   - GET is inherently safe to repeat.
@@ -65435,27 +65436,56 @@ function stripTrailingSlash(url) {
  *     chunk index it is already sending.
  *   - everything else (4xx other than 429, 500) fails fast: the client
  *     never retries a refusal.
+ *
+ * MESSAGE DISCIPLINE: the underlying fetch layer interpolates the full
+ * URL into some of its errors (Node's "Failed to parse URL from …" and
+ * socket failures) — and the signed URLs carry a `sig=` credential in
+ * their query. Every error leaving this module is therefore either one
+ * of the typed, already-redacted errors, or wrapped with the URL's
+ * query stripped.
  */
 
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 class TimeoutFetchError extends Error {
     url;
-    constructor(timeoutMs, url) {
-        super(`request timed out after ${timeoutMs}ms: ${safeUrl(url)}`);
+    /**
+     * @param phase whether the HEADERS or the response BODY stalled —
+     *   both are bounded by the same per-request timeout.
+     */
+    constructor(timeoutMs, url, phase = 'request') {
+        super(`${phase} timed out after ${timeoutMs}ms: ${safeUrl(url)}`);
         this.url = url;
         this.name = 'TimeoutFetchError';
     }
 }
+/** Strips the query string from a URL for safe display. */
 function safeUrl(url) {
     const q = url.indexOf('?');
     return q === -1 ? url : url.slice(0, q);
 }
 /**
- * Performs the request with a hard timeout and the idempotent retry
- * loop. Network failures, timeouts, and the retryable server statuses
- * (429/502/503/504) are retried up to `attempts` total attempts with
- * linear backoff; any other non-2xx returns so the caller maps the
- * protocol vocabulary.
+ * Wraps an error from the fetch layer so no raw URL (with its signed
+ * query) can leak through the message. Typed errors are already safe
+ * and pass through untouched.
+ */
+function wrapFetchError(err, url) {
+    if (err instanceof TimeoutFetchError || err instanceof ProtocolError) {
+        return err;
+    }
+    const raw = err instanceof Error ? err.message : String(err);
+    // Two sweeps: the exact URL this module sent (the common echo), and
+    // any credential-shaped query parameter the layer interpolated from
+    // another rendering of it.
+    let message = raw.split(url).join(safeUrl(url));
+    message = message.replace(/([?&])(sig|token|access_token)=[^&\s'")\\]+/gi, '$1$2=[redacted]');
+    return new Error(`request to ${safeUrl(url)} failed: ${message}`);
+}
+/**
+ * Performs the request with hard timeouts and the idempotent retry
+ * loop. Network failures, timeouts (headers or body), and the
+ * retryable server statuses (429/502/503/504) are retried up to
+ * `attempts` total attempts with linear backoff; any other non-2xx
+ * returns so the caller maps the protocol vocabulary.
  */
 async function fetchBuffer(method, url, headers, body, options) {
     const doFetch = options.fetchImpl ?? fetch;
@@ -65474,11 +65504,14 @@ async function fetchBuffer(method, url, headers, body, options) {
                 await delay(options.backoffMs * attempt);
                 continue;
             }
-            const body_ = new Uint8Array(await response.arrayBuffer());
+            // The abort race above bounds the HEADERS; the body read gets
+            // its own raced timeout so a stalled transfer cannot hang the
+            // client forever.
+            const body_ = new Uint8Array(await readBodyWithTimeout(response, options.timeoutMs, url));
             return { status: response.status, headers: response.headers, body: body_ };
         }
         catch (err) {
-            lastError = err;
+            lastError = wrapFetchError(err, url);
             if (attempt < options.attempts) {
                 await delay(options.backoffMs * attempt);
             }
@@ -65504,7 +65537,8 @@ async function doFetchWithTimeout(doFetch, timeoutMs, req) {
         method: req.method,
         headers: req.headers,
         signal: controller.signal,
-        // Never follow redirects with credentials attached implicitly.
+        // Never follow redirects: the BMC surface never answers with one,
+        // and following could carry the bearer token to another origin.
         redirect: 'error'
     };
     if (req.body !== undefined) {
@@ -65513,6 +65547,27 @@ async function doFetchWithTimeout(doFetch, timeoutMs, req) {
     }
     try {
         return await Promise.race([doFetch(req.url, init), timeout]);
+    }
+    finally {
+        clearTimeout(timerHandle);
+    }
+}
+/**
+ * Reads the response body under its own raced timeout. On timeout the
+ * body stream is cancelled (tearing the connection down) and a typed
+ * error rejects — a stalled multi-gigabyte transfer cannot hang the
+ * client.
+ */
+async function readBodyWithTimeout(response, timeoutMs, url) {
+    let timerHandle;
+    const timeout = new Promise((_, reject) => {
+        timerHandle = setTimeout(() => {
+            reject(new TimeoutFetchError(timeoutMs, url, 'response body'));
+            void response.body?.cancel().catch(() => { });
+        }, timeoutMs);
+    });
+    try {
+        return await Promise.race([response.arrayBuffer(), timeout]);
     }
     finally {
         clearTimeout(timerHandle);
@@ -65589,7 +65644,7 @@ function timer(ms) {
  * web/backend/handlers/runner_results.go (the body-limit middleware
  * admits exactly this bound on the PATCH route).
  */
-const MAX_CHUNK_BYTES = (/* unused pure expression or super */ null && (64 * 1024 * 1024));
+const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
 /** The vocabulary the server's expired arms answer 409 with. */
 const EXPIRED_VOCABULARY = 'expired';
 const DEFAULT_METADATA_TIMEOUT_MS = 30_000;
@@ -65686,11 +65741,31 @@ class BmcArtifactClient {
         }
         return value.map(parseEntry);
     }
-    /** Gets one finalized artifact's detail (404 when missing/out-of-scope). */
+    /**
+     * Gets one finalized artifact's detail (404 when missing/out-of-scope).
+     *
+     * The detail route addresses the artifact by a PATH segment, and the
+     * backend reads that segment RAW (fiber's UnescapePath is off —
+     * web/backend/main.go), so a name needing URL-encoding can miss on
+     * the direct path (`build%20output` never matches the artifact
+     * `build output`). On that 404 the client falls back to the
+     * run-scoped LIST + exact name match — robust regardless of how the
+     * server decodes — before surfacing the not-found refusal.
+     */
     async getArtifact(name) {
         const url = `${this.artifactsPath}/${encodeURIComponent(name)}`;
         const res = await this.request('GET', url, {}, undefined, this.metadataTimeoutMs);
-        this.expectStatusOrNotFound(res, 'GET', url);
+        if (res.status === 404) {
+            const entries = await this.listArtifacts();
+            const found = entries.find(entry => entry.name === name);
+            if (found !== undefined) {
+                return found;
+            }
+            throw new ArtifactNotFoundError('GET', url);
+        }
+        if (res.status < 200 || res.status >= 300) {
+            throw this.mapFailure(res);
+        }
         return parseEntry(parseJsonObject(res.body));
     }
     /**
@@ -66045,12 +66120,16 @@ async function findFilesToUpload(searchPath, includeHiddenFiles) {
 function stageFiles(files, rootDirectory) {
     return files.map(file => {
         const relative = external_path_.relative(rootDirectory, file.absolutePath);
-        if (relative.startsWith('..') || external_path_.isAbsolute(relative)) {
+        // Only an exact '..' path segment escapes the root; a name that
+        // merely STARTS with '..' (a file literally named '..foo') is a
+        // legal entry.
+        const segments = relative.split(external_path_.sep);
+        if (external_path_.isAbsolute(relative) || segments.includes('..')) {
             throw new Error(`found file ${file.absolutePath} escapes the artifact root ${rootDirectory}`);
         }
         return {
             absolutePath: file.absolutePath,
-            entryName: relative.split(external_path_.sep).join('/'),
+            entryName: segments.join('/'),
             size: file.size
         };
     });
@@ -66110,12 +66189,11 @@ async function* packToChunks(files, compressionLevel, chunkSize) {
         throw new Error('packToChunks: no files to pack');
     }
     const packStream = (0,tar_stream.pack)();
-    // mtime is a real zlib option (the gzip header timestamp) supported
-    // at runtime; this @types/node revision omits it from ZlibOptions.
-    const gzip = external_zlib_.createGzip({
-        level: compressionLevel,
-        mtime: 0
-    });
+    // Container determinism: Node's zlib writes MTIME=0 into the gzip
+    // header UNCONDITIONALLY (verified: an mtime option is ignored) —
+    // the header bytes are stable across runs and platforms without any
+    // option of ours.
+    const gzip = external_zlib_.createGzip({ level: compressionLevel });
     packStream.pipe(gzip);
     // Drive the entries sequentially; the tar pack stream propagates the
     // gzip stream's backpressure into each entry write, so the whole
@@ -66291,37 +66369,29 @@ async function writeEntry(destDir, header, entry) {
  */
 
 
+
 /**
  * Uploads the staged files as ONE deterministic gzip'd tar artifact.
  */
 async function uploadArtifact(req) {
-    const chunkSize = req.chunkSize ?? 64 * 1024 * 1024;
+    // The per-chunk cap is the protocol's own constant (the wire's
+    // RunnerResultsMaxChunkBytes) — one source of truth.
+    const chunkSize = req.chunkSize ?? MAX_CHUNK_BYTES;
     const maxAttempts = req.maxCreateAttempts ?? 2;
     if (!req.overwrite) {
         // The duplicate-name refusal happens BEFORE the first byte moves.
-        if (await artifactExists(req.client, req.artifactName)) {
+        // The pre-flight is the run-scoped LIST + exact name match: the
+        // list is the download side's population (finalized artifacts of
+        // this run, whatever job created them), so a duplicate — including
+        // one another job created — fails honestly here instead of taking
+        // the create's silent re-create arm.
+        const existing = await req.client.listArtifacts();
+        if (existing.some(entry => entry.name === req.artifactName)) {
             throw new BmcArtifactError(`an artifact with the name '${req.artifactName}' already exists on this ` +
                 'run. Set overwrite: true to replace it, or choose a different name.');
         }
     }
     return createAndUpload(req, chunkSize, maxAttempts);
-}
-/**
- * Answers whether the named artifact exists on this run. The server's
- * blob-surface 404 unifies missing and out-of-scope, so both read as
- * "no visible artifact to refuse".
- */
-async function artifactExists(client, name) {
-    try {
-        await client.getArtifact(name);
-        return true;
-    }
-    catch (err) {
-        if (err instanceof ArtifactNotFoundError) {
-            return false;
-        }
-        throw err;
-    }
 }
 async function createAndUpload(req, chunkSize, maxAttempts) {
     let lastExpired = null;
@@ -66526,6 +66596,16 @@ function composeArtifactUrl(env, artifactId) {
  */
 
 
+
+// Defense in depth: mask the runtime token in any log rendering
+// before anything runs (only after the marker says this is a BMC
+// runner — on anything else the token is not ours to handle).
+if (process.env[MARKER_ENV] === MARKER_VALUE) {
+    const token = process.env['ACTIONS_RUNTIME_TOKEN'];
+    if (token !== undefined && token.length > 0) {
+        core.setSecret(token);
+    }
+}
 runUpload().catch((err) => {
     const message = err instanceof Error ? err.message : String(err);
     core.setFailed(`Unable to upload artifact(s): ${message}`);

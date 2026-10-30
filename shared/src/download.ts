@@ -123,6 +123,11 @@ export async function downloadArtifacts(
 
   const names: string[] = []
   for (const artifact of artifacts) {
+    // The artifact name comes from the store (any job of the run can
+    // create it), so it is untrusted input for the destination join:
+    // validate it before it can become a path, and assert the resolved
+    // extraction root stays under the destination.
+    assertSafeArtifactName(artifact.name)
     // Upstream layout: a single named artifact (or merge-multiple)
     // extracts straight into the destination; multiple artifacts land
     // in per-artifact directories.
@@ -130,12 +135,53 @@ export async function downloadArtifacts(
       isSingleArtifactDownload || req.mergeMultiple
         ? req.destDir
         : path.join(req.destDir, artifact.name)
+    assertExtractionRootUnderDestination(req.destDir, target)
     await downloadOne(req, artifact, target)
     names.push(artifact.name)
   }
 
   req.log.info(`Total of ${names.length} artifact(s) downloaded`)
   return { downloadPath: req.destDir, artifactNames: names }
+}
+
+/**
+ * Refuses artifact names that could escape the extraction destination:
+ * absolute paths, backslashes, empty path segments, and any `..`
+ * segment. (The backend's create currently trims only — the
+ * client-side guard is what keeps a hostile name from writing outside
+ * `path`.)
+ */
+function assertSafeArtifactName(name: string): void {
+  if (name.startsWith('/') || name.includes('\\')) {
+    throw new Error(
+      `refusing to extract the artifact '${name}': its name is not a safe ` +
+        'relative path'
+    )
+  }
+  if (name.split('/').some(seg => seg === '..' || seg === '')) {
+    throw new Error(
+      `refusing to extract the artifact '${name}': its name escapes the ` +
+        'destination directory'
+    )
+  }
+}
+
+/** Belt and braces: the resolved extraction root must stay under destDir. */
+function assertExtractionRootUnderDestination(
+  destDir: string,
+  target: string
+): void {
+  const resolvedDest = path.resolve(destDir)
+  const resolvedTarget = path.resolve(target)
+  if (
+    resolvedTarget !== resolvedDest &&
+    !resolvedTarget.startsWith(resolvedDest + path.sep)
+  ) {
+    throw new Error(
+      `refusing to extract to '${target}': it resolves outside the ` +
+        `destination '${destDir}'`
+    )
+  }
 }
 
 async function downloadOne(

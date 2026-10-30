@@ -146,6 +146,25 @@ behavioral port of the upstream `src/shared/search.ts` (MIT,
 copyright GitHub). The transport is entirely different: a thin fetch
 client over the BMC protocol — no Azure SDK, no GitHub API.
 
+## Design notes (recorded decisions)
+
+- **artifact-url is a web-UI page, not a download URL.** BMC has no
+  authenticated API artifact URL; jobs exchange artifacts through this
+  action pair within the run. The output is composed from the
+  workflow's own GitHub-context env when present.
+- **The run-id hard-fail is deliberate.** Upstream ignores `run-id`
+  without `github-token` (same-run semantics by default); BMC's
+  run-scope law is stricter and fails loudly on any run-id that does
+  not name the current run, including non-numeric values.
+- **Bundled-but-unused dependencies.** The ncc bundles carry undici and
+  `@actions/http-client` inside `@actions/core`; neither is exercised
+  by this package's transport (the client calls `fetch` directly).
+  Development-only tooling (vitest/vite) is never shipped in `dist/`.
+- **Hostile artifact names are refused at extraction.** The store's
+  create accepts a name as-is (trimmed); the download side refuses
+  absolute paths, backslashes, empty segments, and any `..` segment
+  before a name can join the destination path.
+
 ## Development
 
 ```sh
