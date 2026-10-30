@@ -1,0 +1,5 @@
+# The ncc bundles are machine-generated and committed as-is.
+upload-artifact/dist/
+download-artifact/dist/
+node_modules/
+package-lock.json
