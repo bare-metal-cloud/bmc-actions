@@ -18,11 +18,8 @@
  */
 
 import type { BmcArtifactClient } from './client'
-import {
-  ArtifactNotFoundError,
-  BmcArtifactError,
-  UploadExpiredError
-} from './errors'
+import { MAX_CHUNK_BYTES } from './client'
+import { BmcArtifactError, UploadExpiredError } from './errors'
 import type { PackedFile } from './tar'
 import { packToChunks } from './tar'
 
@@ -60,12 +57,20 @@ export interface UploadOutcome {
 export async function uploadArtifact(
   req: UploadRequest
 ): Promise<UploadOutcome> {
-  const chunkSize = req.chunkSize ?? 64 * 1024 * 1024
+  // The per-chunk cap is the protocol's own constant (the wire's
+  // RunnerResultsMaxChunkBytes) — one source of truth.
+  const chunkSize = req.chunkSize ?? MAX_CHUNK_BYTES
   const maxAttempts = req.maxCreateAttempts ?? 2
 
   if (!req.overwrite) {
     // The duplicate-name refusal happens BEFORE the first byte moves.
-    if (await artifactExists(req.client, req.artifactName)) {
+    // The pre-flight is the run-scoped LIST + exact name match: the
+    // list is the download side's population (finalized artifacts of
+    // this run, whatever job created them), so a duplicate — including
+    // one another job created — fails honestly here instead of taking
+    // the create's silent re-create arm.
+    const existing = await req.client.listArtifacts()
+    if (existing.some(entry => entry.name === req.artifactName)) {
       throw new BmcArtifactError(
         `an artifact with the name '${req.artifactName}' already exists on this ` +
           'run. Set overwrite: true to replace it, or choose a different name.'
@@ -73,26 +78,6 @@ export async function uploadArtifact(
     }
   }
   return createAndUpload(req, chunkSize, maxAttempts)
-}
-
-/**
- * Answers whether the named artifact exists on this run. The server's
- * blob-surface 404 unifies missing and out-of-scope, so both read as
- * "no visible artifact to refuse".
- */
-async function artifactExists(
-  client: BmcArtifactClient,
-  name: string
-): Promise<boolean> {
-  try {
-    await client.getArtifact(name)
-    return true
-  } catch (err) {
-    if (err instanceof ArtifactNotFoundError) {
-      return false
-    }
-    throw err
-  }
 }
 
 async function createAndUpload(

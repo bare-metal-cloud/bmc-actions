@@ -279,7 +279,10 @@ export function startFakeServer(options: {
       }
 
       if (req.method === 'GET' && rest.split('/').length === 4) {
-        const name = decodeURIComponent(rest.split('/')[3] ?? '')
+        // The backend reads the RAW path segment (fiber's UnescapePath
+        // is off) — the fake mirrors that fidelity, encoded names and
+        // all. The client's list-fallback is what rescues them.
+        const name = rest.split('/')[3] ?? ''
         const row = rowsByName.get(name)
         if (row === undefined || row.state !== 'finalized') {
           fail(res, 404, 'artifact not found')

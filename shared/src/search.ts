@@ -163,14 +163,18 @@ export function stageFiles(
 ): { absolutePath: string; entryName: string; size: number }[] {
   return files.map(file => {
     const relative = path.relative(rootDirectory, file.absolutePath)
-    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    // Only an exact '..' path segment escapes the root; a name that
+    // merely STARTS with '..' (a file literally named '..foo') is a
+    // legal entry.
+    const segments = relative.split(path.sep)
+    if (path.isAbsolute(relative) || segments.includes('..')) {
       throw new Error(
         `found file ${file.absolutePath} escapes the artifact root ${rootDirectory}`
       )
     }
     return {
       absolutePath: file.absolutePath,
-      entryName: relative.split(path.sep).join('/'),
+      entryName: segments.join('/'),
       size: file.size
     }
   })

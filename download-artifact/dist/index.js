@@ -31293,8 +31293,9 @@ function stripTrailingSlash(url) {
 
 ;// CONCATENATED MODULE: ./shared/src/http.ts
 /**
- * Thin fetch wrapper: a timeout on every request and a small retry loop
- * ONLY where the protocol has an idempotent story.
+ * Thin fetch wrapper: a timeout on every request AND on every body
+ * read, a never-followed redirect policy, and a small retry loop ONLY
+ * where the protocol has an idempotent story.
  *
  * Retry law (verified against the backend handler, story B5.2):
  *   - GET is inherently safe to repeat.
@@ -31310,27 +31311,56 @@ function stripTrailingSlash(url) {
  *     chunk index it is already sending.
  *   - everything else (4xx other than 429, 500) fails fast: the client
  *     never retries a refusal.
+ *
+ * MESSAGE DISCIPLINE: the underlying fetch layer interpolates the full
+ * URL into some of its errors (Node's "Failed to parse URL from …" and
+ * socket failures) — and the signed URLs carry a `sig=` credential in
+ * their query. Every error leaving this module is therefore either one
+ * of the typed, already-redacted errors, or wrapped with the URL's
+ * query stripped.
  */
 
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 class TimeoutFetchError extends Error {
     url;
-    constructor(timeoutMs, url) {
-        super(`request timed out after ${timeoutMs}ms: ${safeUrl(url)}`);
+    /**
+     * @param phase whether the HEADERS or the response BODY stalled —
+     *   both are bounded by the same per-request timeout.
+     */
+    constructor(timeoutMs, url, phase = 'request') {
+        super(`${phase} timed out after ${timeoutMs}ms: ${safeUrl(url)}`);
         this.url = url;
         this.name = 'TimeoutFetchError';
     }
 }
+/** Strips the query string from a URL for safe display. */
 function safeUrl(url) {
     const q = url.indexOf('?');
     return q === -1 ? url : url.slice(0, q);
 }
 /**
- * Performs the request with a hard timeout and the idempotent retry
- * loop. Network failures, timeouts, and the retryable server statuses
- * (429/502/503/504) are retried up to `attempts` total attempts with
- * linear backoff; any other non-2xx returns so the caller maps the
- * protocol vocabulary.
+ * Wraps an error from the fetch layer so no raw URL (with its signed
+ * query) can leak through the message. Typed errors are already safe
+ * and pass through untouched.
+ */
+function wrapFetchError(err, url) {
+    if (err instanceof TimeoutFetchError || err instanceof ProtocolError) {
+        return err;
+    }
+    const raw = err instanceof Error ? err.message : String(err);
+    // Two sweeps: the exact URL this module sent (the common echo), and
+    // any credential-shaped query parameter the layer interpolated from
+    // another rendering of it.
+    let message = raw.split(url).join(safeUrl(url));
+    message = message.replace(/([?&])(sig|token|access_token)=[^&\s'")\\]+/gi, '$1$2=[redacted]');
+    return new Error(`request to ${safeUrl(url)} failed: ${message}`);
+}
+/**
+ * Performs the request with hard timeouts and the idempotent retry
+ * loop. Network failures, timeouts (headers or body), and the
+ * retryable server statuses (429/502/503/504) are retried up to
+ * `attempts` total attempts with linear backoff; any other non-2xx
+ * returns so the caller maps the protocol vocabulary.
  */
 async function fetchBuffer(method, url, headers, body, options) {
     const doFetch = options.fetchImpl ?? fetch;
@@ -31349,11 +31379,14 @@ async function fetchBuffer(method, url, headers, body, options) {
                 await delay(options.backoffMs * attempt);
                 continue;
             }
-            const body_ = new Uint8Array(await response.arrayBuffer());
+            // The abort race above bounds the HEADERS; the body read gets
+            // its own raced timeout so a stalled transfer cannot hang the
+            // client forever.
+            const body_ = new Uint8Array(await readBodyWithTimeout(response, options.timeoutMs, url));
             return { status: response.status, headers: response.headers, body: body_ };
         }
         catch (err) {
-            lastError = err;
+            lastError = wrapFetchError(err, url);
             if (attempt < options.attempts) {
                 await delay(options.backoffMs * attempt);
             }
@@ -31379,7 +31412,8 @@ async function doFetchWithTimeout(doFetch, timeoutMs, req) {
         method: req.method,
         headers: req.headers,
         signal: controller.signal,
-        // Never follow redirects with credentials attached implicitly.
+        // Never follow redirects: the BMC surface never answers with one,
+        // and following could carry the bearer token to another origin.
         redirect: 'error'
     };
     if (req.body !== undefined) {
@@ -31388,6 +31422,27 @@ async function doFetchWithTimeout(doFetch, timeoutMs, req) {
     }
     try {
         return await Promise.race([doFetch(req.url, init), timeout]);
+    }
+    finally {
+        clearTimeout(timerHandle);
+    }
+}
+/**
+ * Reads the response body under its own raced timeout. On timeout the
+ * body stream is cancelled (tearing the connection down) and a typed
+ * error rejects — a stalled multi-gigabyte transfer cannot hang the
+ * client.
+ */
+async function readBodyWithTimeout(response, timeoutMs, url) {
+    let timerHandle;
+    const timeout = new Promise((_, reject) => {
+        timerHandle = setTimeout(() => {
+            reject(new TimeoutFetchError(timeoutMs, url, 'response body'));
+            void response.body?.cancel().catch(() => { });
+        }, timeoutMs);
+    });
+    try {
+        return await Promise.race([response.arrayBuffer(), timeout]);
     }
     finally {
         clearTimeout(timerHandle);
@@ -31561,11 +31616,31 @@ class BmcArtifactClient {
         }
         return value.map(parseEntry);
     }
-    /** Gets one finalized artifact's detail (404 when missing/out-of-scope). */
+    /**
+     * Gets one finalized artifact's detail (404 when missing/out-of-scope).
+     *
+     * The detail route addresses the artifact by a PATH segment, and the
+     * backend reads that segment RAW (fiber's UnescapePath is off —
+     * web/backend/main.go), so a name needing URL-encoding can miss on
+     * the direct path (`build%20output` never matches the artifact
+     * `build output`). On that 404 the client falls back to the
+     * run-scoped LIST + exact name match — robust regardless of how the
+     * server decodes — before surfacing the not-found refusal.
+     */
     async getArtifact(name) {
         const url = `${this.artifactsPath}/${encodeURIComponent(name)}`;
         const res = await this.request('GET', url, {}, undefined, this.metadataTimeoutMs);
-        this.expectStatusOrNotFound(res, 'GET', url);
+        if (res.status === 404) {
+            const entries = await this.listArtifacts();
+            const found = entries.find(entry => entry.name === name);
+            if (found !== undefined) {
+                return found;
+            }
+            throw new ArtifactNotFoundError('GET', url);
+        }
+        if (res.status < 200 || res.status >= 300) {
+            throw this.mapFailure(res);
+        }
         return parseEntry(parseJsonObject(res.body));
     }
     /**
@@ -33796,12 +33871,11 @@ async function* packToChunks(files, compressionLevel, chunkSize) {
         throw new Error('packToChunks: no files to pack');
     }
     const packStream = tarPack();
-    // mtime is a real zlib option (the gzip header timestamp) supported
-    // at runtime; this @types/node revision omits it from ZlibOptions.
-    const gzip = zlib.createGzip({
-        level: compressionLevel,
-        mtime: 0
-    });
+    // Container determinism: Node's zlib writes MTIME=0 into the gzip
+    // header UNCONDITIONALLY (verified: an mtime option is ignored) —
+    // the header bytes are stable across runs and platforms without any
+    // option of ours.
+    const gzip = zlib.createGzip({ level: compressionLevel });
     packStream.pipe(gzip);
     // Drive the entries sequentially; the tar pack stream propagates the
     // gzip stream's backpressure into each entry write, so the whole
@@ -34047,17 +34121,50 @@ async function downloadArtifacts(req) {
     }
     const names = [];
     for (const artifact of artifacts) {
+        // The artifact name comes from the store (any job of the run can
+        // create it), so it is untrusted input for the destination join:
+        // validate it before it can become a path, and assert the resolved
+        // extraction root stays under the destination.
+        assertSafeArtifactName(artifact.name);
         // Upstream layout: a single named artifact (or merge-multiple)
         // extracts straight into the destination; multiple artifacts land
         // in per-artifact directories.
         const target = isSingleArtifactDownload || req.mergeMultiple
             ? req.destDir
             : external_path_.join(req.destDir, artifact.name);
+        assertExtractionRootUnderDestination(req.destDir, target);
         await downloadOne(req, artifact, target);
         names.push(artifact.name);
     }
     req.log.info(`Total of ${names.length} artifact(s) downloaded`);
     return { downloadPath: req.destDir, artifactNames: names };
+}
+/**
+ * Refuses artifact names that could escape the extraction destination:
+ * absolute paths, backslashes, empty path segments, and any `..`
+ * segment. (The backend's create currently trims only — the
+ * client-side guard is what keeps a hostile name from writing outside
+ * `path`.)
+ */
+function assertSafeArtifactName(name) {
+    if (name.startsWith('/') || name.includes('\\')) {
+        throw new Error(`refusing to extract the artifact '${name}': its name is not a safe ` +
+            'relative path');
+    }
+    if (name.split('/').some(seg => seg === '..' || seg === '')) {
+        throw new Error(`refusing to extract the artifact '${name}': its name escapes the ` +
+            'destination directory');
+    }
+}
+/** Belt and braces: the resolved extraction root must stay under destDir. */
+function assertExtractionRootUnderDestination(destDir, target) {
+    const resolvedDest = external_path_.resolve(destDir);
+    const resolvedTarget = external_path_.resolve(target);
+    if (resolvedTarget !== resolvedDest &&
+        !resolvedTarget.startsWith(resolvedDest + external_path_.sep)) {
+        throw new Error(`refusing to extract to '${target}': it resolves outside the ` +
+            `destination '${destDir}'`);
+    }
 }
 async function downloadOne(req, artifact, targetDir) {
     const files = await req.client.listFiles(artifact.fileContainerResourceUrl);
@@ -34132,19 +34239,23 @@ async function runDownload(env = process.env) {
             'artifacts are scoped to the current workflow run');
     }
     // The BMC token is bound to ITS run; another run's id would be
-    // refused server-side. Fail here, loudly, instead.
+    // refused server-side. Fail here, loudly, instead — and a run-id
+    // that is not a positive integer at all takes the same run-scope
+    // error rather than silently falling through to the current run.
     const runIdInput = core.getInput('run-id');
     if (runIdInput.length > 0) {
-        const wanted = Number.parseInt(runIdInput, 10);
-        const current = env['GITHUB_RUN_ID'];
-        if (!Number.isNaN(wanted) &&
-            current !== undefined &&
-            current !== '' &&
-            wanted !== Number.parseInt(current, 10)) {
-            throw new RunnerEnvError(`the run-id input (${wanted}) names another workflow run: BMC ` +
-                "artifacts are scoped to the current run and the job's runtime " +
-                `token authorizes run ${current} only. Cross-run downloads do ` +
-                'not exist on BMC.');
+        const current = env['GITHUB_RUN_ID'] ?? '';
+        const wanted = /^[1-9][0-9]*$/.test(runIdInput)
+            ? Number.parseInt(runIdInput, 10)
+            : null;
+        const currentId = /^[1-9][0-9]*$/.test(current)
+            ? Number.parseInt(current, 10)
+            : null;
+        if (wanted === null || (currentId !== null && wanted !== currentId)) {
+            throw new RunnerEnvError(`the run-id input ('${runIdInput}') does not name the current ` +
+                'workflow run: BMC artifacts are scoped to the current run and ' +
+                `the job's runtime token authorizes run ${current} only. ` +
+                'Cross-run downloads do not exist on BMC.');
         }
     }
     let artifactIds = [];
@@ -34194,6 +34305,16 @@ async function runDownload(env = process.env) {
  */
 
 
+
+// Defense in depth: mask the runtime token in any log rendering
+// before anything runs (only after the marker says this is a BMC
+// runner — on anything else the token is not ours to handle).
+if (process.env[MARKER_ENV] === MARKER_VALUE) {
+    const token = process.env['ACTIONS_RUNTIME_TOKEN'];
+    if (token !== undefined && token.length > 0) {
+        core.setSecret(token);
+    }
+}
 runDownload().catch((err) => {
     const message = err instanceof Error ? err.message : String(err);
     core.setFailed(`Unable to download artifact(s): ${message}`);

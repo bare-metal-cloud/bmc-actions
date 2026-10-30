@@ -67,22 +67,24 @@ export async function runDownload(
   }
 
   // The BMC token is bound to ITS run; another run's id would be
-  // refused server-side. Fail here, loudly, instead.
+  // refused server-side. Fail here, loudly, instead — and a run-id
+  // that is not a positive integer at all takes the same run-scope
+  // error rather than silently falling through to the current run.
   const runIdInput = core.getInput('run-id')
   if (runIdInput.length > 0) {
-    const wanted = Number.parseInt(runIdInput, 10)
-    const current = env['GITHUB_RUN_ID']
-    if (
-      !Number.isNaN(wanted) &&
-      current !== undefined &&
-      current !== '' &&
-      wanted !== Number.parseInt(current, 10)
-    ) {
+    const current = env['GITHUB_RUN_ID'] ?? ''
+    const wanted = /^[1-9][0-9]*$/.test(runIdInput)
+      ? Number.parseInt(runIdInput, 10)
+      : null
+    const currentId = /^[1-9][0-9]*$/.test(current)
+      ? Number.parseInt(current, 10)
+      : null
+    if (wanted === null || (currentId !== null && wanted !== currentId)) {
       throw new RunnerEnvError(
-        `the run-id input (${wanted}) names another workflow run: BMC ` +
-          "artifacts are scoped to the current run and the job's runtime " +
-          `token authorizes run ${current} only. Cross-run downloads do ` +
-          'not exist on BMC.'
+        `the run-id input ('${runIdInput}') does not name the current ` +
+          'workflow run: BMC artifacts are scoped to the current run and ' +
+          `the job's runtime token authorizes run ${current} only. ` +
+          'Cross-run downloads do not exist on BMC.'
       )
     }
   }

@@ -237,6 +237,135 @@ describe('list, detail, files, download, delete', () => {
   })
 })
 
+describe('named detail with encoded names (B1)', () => {
+  it('a name needing URL encoding resolves through the list fallback', async () => {
+    const c = client()
+    const created = await c.createArtifact('build output')
+    await c.uploadChunk(created.uploadUrl, 0, Buffer.from('encoded-bytes'))
+    await c.finalizeArtifact('build output')
+    // The backend reads the RAW path segment, so the direct detail of
+    // the encoded form 404s; the run-scoped list + exact match rescues.
+    const entry = await c.getArtifact('build output')
+    expect(entry.name).toBe('build output')
+    expect(entry.size).toBe(Buffer.byteLength('encoded-bytes'))
+  })
+})
+
+describe('transport hardening (B3 / N1)', () => {
+  it('an error from a signed-URL endpoint never leaks the sig query', async () => {
+    const c = client()
+    const created = await c.createArtifact('sig-leak')
+    await c.uploadChunk(created.uploadUrl, 0, Buffer.from('x'))
+    await c.finalizeArtifact('sig-leak')
+    const entry = await c.getArtifact('sig-leak')
+    const files = await c.listFiles(entry.fileContainerResourceUrl)
+    const location = files[0]!.contentLocation
+    const realSig = new URL(location).searchParams.get('sig') ?? ''
+    expect(realSig.length).toBeGreaterThan(0)
+    // Tamper the signature so the runner-blob GET answers 401 WITH the
+    // sig still sitting in the request URL.
+    const tampered = location.replace(
+      realSig,
+      `${'A'.repeat(20)}.${'B'.repeat(20)}`
+    )
+    const err = await c.downloadBytes(tampered).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(Error)
+    const message = (err as Error).message
+    expect(message).not.toContain(realSig)
+    expect(message).not.toContain('sig=')
+    expect(message).not.toContain('AAAA')
+    expect(message).toContain('the signed blob URL is malformed')
+  })
+
+  it('the transport refuses redirects: redirect: error reaches fetch', async () => {
+    let capturedInit: RequestInit | undefined
+    const c = new BmcArtifactClient({
+      resultsUrl: server.url,
+      runtimeToken: TEST_TOKEN,
+      runId: TEST_RUN_ID,
+      attempts: 1,
+      backoffMs: 1,
+      fetchImpl: ((_url, init) => {
+        capturedInit = init
+        return Promise.reject(new TypeError('fetch failed'))
+      }) as typeof fetch
+    })
+    await expect(c.listArtifacts()).rejects.toThrow(/failed/)
+    // The mutation witness: flipping http.ts to redirect: 'follow'
+    // surfaces here and fails this assertion.
+    expect(capturedInit?.redirect).toBe('error')
+  })
+
+  it('a 302 answer is refused, never followed', async () => {
+    let calls = 0
+    const c = new BmcArtifactClient({
+      resultsUrl: server.url,
+      runtimeToken: TEST_TOKEN,
+      runId: TEST_RUN_ID,
+      attempts: 1,
+      fetchImpl: (() => {
+        calls++
+        return Promise.resolve(
+          new Response(null, {
+            status: 302,
+            headers: { location: 'https://evil.example/steal' }
+          })
+        )
+      }) as typeof fetch
+    })
+    const err = await c.listArtifacts().catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ProtocolError)
+    expect((err as ProtocolError).status).toBe(302)
+    expect(calls).toBe(1)
+  })
+
+  it('a stalled response body times out (the body read is bounded too)', async () => {
+    const c = new BmcArtifactClient({
+      resultsUrl: server.url,
+      runtimeToken: TEST_TOKEN,
+      runId: TEST_RUN_ID,
+      attempts: 1,
+      metadataTimeoutMs: 100,
+      fetchImpl: (() => {
+        // Headers arrive immediately; the body stream never delivers
+        // a byte and never closes.
+        const body = new ReadableStream<Uint8Array>({ start() {} })
+        return Promise.resolve(
+          new Response(body, {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        )
+      }) as typeof fetch
+    })
+    await expect(c.listArtifacts()).rejects.toThrow(
+      /response body timed out after 100ms/
+    )
+  })
+
+  it('a raw fetch error never echoes the signed URL', async () => {
+    const signedUrl = `${server.url}/api/v1/runner-runtime/runner-blob?sig=abc.def`
+    const c = new BmcArtifactClient({
+      resultsUrl: server.url,
+      runtimeToken: TEST_TOKEN,
+      runId: TEST_RUN_ID,
+      attempts: 1,
+      fetchImpl: ((reqUrl: string | URL | Request) => {
+        // Node's own layer interpolates the full URL into some errors.
+        return Promise.reject(
+          new TypeError(`Failed to parse URL from ${reqUrl}`)
+        )
+      }) as unknown as typeof fetch
+    })
+    const err = await c.downloadBytes(signedUrl).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(Error)
+    const message = (err as Error).message
+    expect(message).not.toContain('sig=')
+    expect(message).not.toContain('abc.def')
+    expect(message).toContain('failed')
+  })
+})
+
 describe('message discipline', () => {
   it('errors never carry the runtime token or a signature', async () => {
     const secretToken = 'super-secret-token-1234567890'

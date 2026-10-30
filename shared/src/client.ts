@@ -252,7 +252,17 @@ export class BmcArtifactClient {
     return value.map(parseEntry)
   }
 
-  /** Gets one finalized artifact's detail (404 when missing/out-of-scope). */
+  /**
+   * Gets one finalized artifact's detail (404 when missing/out-of-scope).
+   *
+   * The detail route addresses the artifact by a PATH segment, and the
+   * backend reads that segment RAW (fiber's UnescapePath is off —
+   * web/backend/main.go), so a name needing URL-encoding can miss on
+   * the direct path (`build%20output` never matches the artifact
+   * `build output`). On that 404 the client falls back to the
+   * run-scoped LIST + exact name match — robust regardless of how the
+   * server decodes — before surfacing the not-found refusal.
+   */
   public async getArtifact(name: string): Promise<ArtifactEntry> {
     const url = `${this.artifactsPath}/${encodeURIComponent(name)}`
     const res = await this.request(
@@ -262,7 +272,17 @@ export class BmcArtifactClient {
       undefined,
       this.metadataTimeoutMs
     )
-    this.expectStatusOrNotFound(res, 'GET', url)
+    if (res.status === 404) {
+      const entries = await this.listArtifacts()
+      const found = entries.find(entry => entry.name === name)
+      if (found !== undefined) {
+        return found
+      }
+      throw new ArtifactNotFoundError('GET', url)
+    }
+    if (res.status < 200 || res.status >= 300) {
+      throw this.mapFailure(res)
+    }
     return parseEntry(parseJsonObject(res.body))
   }
 

@@ -70,12 +70,11 @@ export async function* packToChunks(
     throw new Error('packToChunks: no files to pack')
   }
   const packStream = tarPack()
-  // mtime is a real zlib option (the gzip header timestamp) supported
-  // at runtime; this @types/node revision omits it from ZlibOptions.
-  const gzip = zlib.createGzip({
-    level: compressionLevel,
-    mtime: 0
-  } as zlib.ZlibOptions)
+  // Container determinism: Node's zlib writes MTIME=0 into the gzip
+  // header UNCONDITIONALLY (verified: an mtime option is ignored) —
+  // the header bytes are stable across runs and platforms without any
+  // option of ours.
+  const gzip = zlib.createGzip({ level: compressionLevel })
   packStream.pipe(gzip)
 
   // Drive the entries sequentially; the tar pack stream propagates the
