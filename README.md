@@ -160,10 +160,12 @@ client over the BMC protocol — no Azure SDK, no GitHub API.
   `@actions/http-client` inside `@actions/core`; neither is exercised
   by this package's transport (the client calls `fetch` directly).
   Development-only tooling (vitest/vite) is never shipped in `dist/`.
-- **Hostile artifact names are refused at extraction.** The store's
-  create accepts a name as-is (trimmed); the download side refuses
-  absolute paths, backslashes, empty segments, and any `..` segment
-  before a name can join the destination path.
+- **Hostile artifact names are guarded at two layers.** The store's
+  create refuses separators, control characters, and `..` names with a
+  400 (the server-side flat-identifier guard), and the download side
+  independently refuses absolute paths, backslashes, empty segments,
+  and any `..` segment before a name can join the destination path
+  (the client-side extraction guard).
 
 ## Development
 

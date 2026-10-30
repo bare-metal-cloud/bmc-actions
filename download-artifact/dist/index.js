@@ -31368,22 +31368,18 @@ async function fetchBuffer(method, url, headers, body, options) {
     let lastError;
     for (let attempt = 1; attempt <= options.attempts; attempt++) {
         try {
-            const response = await doFetchWithTimeout(doFetch, options.timeoutMs, {
+            const result = await requestOnce(doFetch, options.timeoutMs, {
                 method,
                 url,
                 headers,
                 body
             });
-            if (RETRYABLE_STATUS.has(response.status) && attempt < options.attempts) {
-                lastError = new ProtocolError(response.status, method, url, await safeErrorText(response));
+            if (RETRYABLE_STATUS.has(result.status) && attempt < options.attempts) {
+                lastError = new ProtocolError(result.status, method, url, safeErrorText(result));
                 await delay(options.backoffMs * attempt);
                 continue;
             }
-            // The abort race above bounds the HEADERS; the body read gets
-            // its own raced timeout so a stalled transfer cannot hang the
-            // client forever.
-            const body_ = new Uint8Array(await readBodyWithTimeout(response, options.timeoutMs, url));
-            return { status: response.status, headers: response.headers, body: body_ };
+            return result;
         }
         catch (err) {
             lastError = wrapFetchError(err, url);
@@ -31396,18 +31392,34 @@ async function fetchBuffer(method, url, headers, body, options) {
         ? lastError
         : new Error(`request to ${safeUrl(url)} failed`);
 }
-async function doFetchWithTimeout(doFetch, timeoutMs, req) {
+/**
+ * ONE request attempt: the headers arrive under a raced timeout, and
+ * the SAME request-level AbortController stays alive through the body
+ * read under a second raced timeout — a stalled body aborts the actual
+ * fetch (the signal is what tears the undici connection down), where a
+ * post-hoc body.cancel() cannot (the stream is locked by the reader).
+ * The timeout is a RACE, not just an abort: a fetch that honors the
+ * signal rejects on abort, but one that ignores it can never settle —
+ * the racing rejection bounds every phase either way.
+ */
+async function requestOnce(doFetch, timeoutMs, req) {
     const controller = new AbortController();
-    // The timeout is a RACE, not just an abort: a fetch that honors the
-    // signal rejects on abort, but one that ignores it can never settle —
-    // the racing rejection bounds every request either way.
-    let timerHandle;
-    const timeout = new Promise((_, reject) => {
-        timerHandle = setTimeout(() => {
-            controller.abort();
-            reject(new TimeoutFetchError(timeoutMs, req.url));
-        }, timeoutMs);
-    });
+    const stall = (phase) => {
+        let timerHandle;
+        const timeout = new Promise((_, reject) => {
+            timerHandle = setTimeout(() => {
+                controller.abort();
+                reject(new TimeoutFetchError(timeoutMs, req.url, phase));
+            }, timeoutMs);
+        });
+        return {
+            timeout,
+            clear: () => {
+                clearTimeout(timerHandle);
+            }
+        };
+    };
+    const headers = stall('request');
     const init = {
         method: req.method,
         headers: req.headers,
@@ -31420,42 +31432,32 @@ async function doFetchWithTimeout(doFetch, timeoutMs, req) {
         // Node 20's undici-backed fetch accepts a Uint8Array body.
         init.body = new Uint8Array(req.body);
     }
+    let response;
     try {
-        return await Promise.race([doFetch(req.url, init), timeout]);
+        response = await Promise.race([doFetch(req.url, init), headers.timeout]);
     }
     finally {
-        clearTimeout(timerHandle);
+        headers.clear();
     }
-}
-/**
- * Reads the response body under its own raced timeout. On timeout the
- * body stream is cancelled (tearing the connection down) and a typed
- * error rejects — a stalled multi-gigabyte transfer cannot hang the
- * client.
- */
-async function readBodyWithTimeout(response, timeoutMs, url) {
-    let timerHandle;
-    const timeout = new Promise((_, reject) => {
-        timerHandle = setTimeout(() => {
-            reject(new TimeoutFetchError(timeoutMs, url, 'response body'));
-            void response.body?.cancel().catch(() => { });
-        }, timeoutMs);
-    });
+    const bodyStall = stall('response body');
     try {
-        return await Promise.race([response.arrayBuffer(), timeout]);
+        const buffer = await Promise.race([
+            response.arrayBuffer(),
+            bodyStall.timeout
+        ]);
+        return {
+            status: response.status,
+            headers: response.headers,
+            body: new Uint8Array(buffer)
+        };
     }
     finally {
-        clearTimeout(timerHandle);
+        bodyStall.clear();
     }
 }
-async function safeErrorText(response) {
-    try {
-        const text = await response.text();
-        return text.length > 300 ? `${text.slice(0, 300)}…` : text;
-    }
-    catch {
-        return '';
-    }
+function safeErrorText(result) {
+    const text = new TextDecoder().decode(result.body);
+    return text.length > 300 ? `${text.slice(0, 300)}…` : text;
 }
 function timer(ms) {
     return new Promise(resolve => {

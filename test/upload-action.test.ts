@@ -224,6 +224,36 @@ describe('upload-artifact end to end', () => {
     })
   })
 
+  it("a file literally named '..foo' is a legal entry (the exact-segment guard)", async () => {
+    // N6's witness: only an exact '..' path segment escapes the
+    // artifact root — a NAME that merely starts with '..' is a legal
+    // file. Reverting the guard to a startsWith check fails this test.
+    // (include-hidden-files is on because any dot-leading name is
+    // excluded by the upstream hidden-file filter otherwise — that
+    // exclusion is separate from the escape guard.)
+    fs.mkdirSync(path.join(workspace, 'dotdot'))
+    fs.writeFileSync(
+      path.join(workspace, 'dotdot', '..foo'),
+      'dotdot-foo-bytes'
+    )
+    fs.writeFileSync(path.join(workspace, 'dotdot', 'plain.txt'), 'plain')
+
+    const result = await runWith({
+      name: 'dotdot-names',
+      path: `${workspace}/dotdot/*`,
+      'include-hidden-files': 'true'
+    })
+    expect(result.error).toBeNull()
+    const stored = server.bytes('dotdot-names')
+    expect(stored).toBeDefined()
+    const out = path.join(workspace, 'dotdot-out')
+    const written = await extractTarGz(stored!, out)
+    expect(written.sort()).toEqual(['..foo', 'plain.txt'])
+    expect(fs.readFileSync(path.join(out, '..foo'), 'utf8')).toBe(
+      'dotdot-foo-bytes'
+    )
+  })
+
   it('retention-days is accepted with the org-policy warning', async () => {
     fs.writeFileSync(path.join(workspace, 'keep.txt'), 'x')
     const result = await runWith({
