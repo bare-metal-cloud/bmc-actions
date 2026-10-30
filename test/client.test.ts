@@ -319,14 +319,16 @@ describe('transport hardening (B3 / N1)', () => {
     expect(calls).toBe(1)
   })
 
-  it('a stalled response body times out (the body read is bounded too)', async () => {
+  it('a stalled response body times out and aborts the request signal', async () => {
+    let capturedSignal: AbortSignal | null | undefined
     const c = new BmcArtifactClient({
       resultsUrl: server.url,
       runtimeToken: TEST_TOKEN,
       runId: TEST_RUN_ID,
       attempts: 1,
       metadataTimeoutMs: 100,
-      fetchImpl: (() => {
+      fetchImpl: ((_url, init) => {
+        capturedSignal = init?.signal
         // Headers arrive immediately; the body stream never delivers
         // a byte and never closes.
         const body = new ReadableStream<Uint8Array>({ start() {} })
@@ -341,6 +343,10 @@ describe('transport hardening (B3 / N1)', () => {
     await expect(c.listArtifacts()).rejects.toThrow(
       /response body timed out after 100ms/
     )
+    // The body timeout aborts the REQUEST-level signal — the real
+    // teardown path (a post-hoc body.cancel() cannot: the stream is
+    // locked by the reader).
+    expect(capturedSignal?.aborted).toBe(true)
   })
 
   it('a raw fetch error never echoes the signed URL', async () => {
