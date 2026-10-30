@@ -1,0 +1,62 @@
+name: 'Download a Build Artifact (BMC)'
+description: >-
+  Download a build artifact from the BMC artifact store. Drop-in for
+  actions/download-artifact@v4 on BMC runners — BMC runners ONLY: the
+  runner must have the BMC artifact store mounted (staged by the BMC
+  start operation as BMC_ARTIFACT_STORE='1'). Downloads are scoped to
+  the current workflow run (any job of the run can download an earlier
+  job's artifact). On GitHub-hosted runners the action refuses loudly
+  and makes no network calls; keep actions/download-artifact there.
+author: 'bare-metal-cloud'
+inputs:
+  name:
+    description: 'Name of the artifact to download. If unspecified, all artifacts for the run are downloaded.'
+    required: false
+  artifact-ids:
+    description: >-
+      IDs of the artifacts to download, comma-separated. Either inputs
+      `artifact-ids` or `name` can be used, but not both. The IDs are
+      the BMC artifact ids surfaced as upload-artifact's artifact-id
+      output within the same run.
+    required: false
+  path:
+    description: 'Destination path. Supports basic tilde expansion. Defaults to $GITHUB_WORKSPACE'
+    required: false
+  pattern:
+    description: 'A glob pattern matching the artifacts that should be downloaded. Ignored if name is specified.'
+    required: false
+  merge-multiple:
+    description: >-
+      When multiple artifacts are matched, this changes the behavior of the destination directories.
+      If true, the downloaded artifacts will be in the same directory specified by path.
+      If false, the downloaded artifacts will be extracted into individual named directories within the specified path.
+    required: false
+    default: 'false'
+  github-token:
+    description: >-
+      Accepted for upstream compatibility and IGNORED: BMC artifacts are
+      scoped to the current workflow run and authorized by the job's
+      runtime token — cross-repository or cross-run downloads do not
+      exist on BMC. A warning is emitted when this input is set.
+    required: false
+  repository:
+    description: >-
+      Accepted for upstream compatibility and IGNORED (see github-token).
+      A warning is emitted when this input is set to something other
+      than the current repository.
+    required: false
+    default: ${{ github.repository }}
+  run-id:
+    description: >-
+      The id of the workflow run where the desired artifact was uploaded
+      from. BMC artifacts are run-scoped: this must be the current run
+      (the default ${{ github.run_id }}); any other value fails the
+      action before any network call.
+    required: false
+    default: ${{ github.run_id }}
+outputs:
+  download-path:
+    description: 'Path of artifact download'
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
