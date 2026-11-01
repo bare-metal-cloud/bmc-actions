@@ -65365,6 +65365,15 @@ function assertBmcArtifactStore(actionName, env = process.env) {
  *     `Authorization: Bearer <token>` on EVERY control-plane call
  *   - BMC_ARTIFACT_STORE='1' — the store marker (see marker.ts)
  *
+ * THE BMC-NAMESPACED OVERRIDE (the runners drill's live finding,
+ * 2026-11-01): GitHub's job message unconditionally overwrites
+ * ACTIONS_RESULTS_URL and ACTIONS_RUNTIME_TOKEN in the runner process
+ * env with the GitHub-side values — no launch-seam .env or start-op
+ * render can beat it. The start operation therefore ALSO stages the CP's
+ * values under BMC_ACTIONS_RESULTS_URL / BMC_ACTIONS_RUNTIME_TOKEN, and
+ * the reader prefers the BMC names, falling back to the standard names
+ * for launch seams that can hold the line.
+ *
  * The run id comes from GITHUB_RUN_ID, which the runner harness stages
  * for every job the way GitHub-hosted runners do. The token is
  * job-bound and run-bound: the :runId path segment MUST be the token's
@@ -65380,18 +65389,26 @@ function assertBmcArtifactStore(actionName, env = process.env) {
  * before any network call — when a variable is missing or malformed.
  */
 function readRunnerRuntime(env) {
-    const resultsUrl = (env['ACTIONS_RESULTS_URL'] ?? '').trim();
+    const resultsUrl = (env['BMC_ACTIONS_RESULTS_URL'] ??
+        env['ACTIONS_RESULTS_URL'] ??
+        '').trim();
     if (resultsUrl === '') {
         throw new RunnerEnvError('ACTIONS_RESULTS_URL is not set: this runner job has no BMC results ' +
             'endpoint staged. (The BMC start operation stages it together with ' +
             `BMC_ARTIFACT_STORE='1' — if one is missing, the store is not ` +
-            'mounted and the action cannot run.)');
+            'mounted and the action cannot run. GitHub\u2019s job message ' +
+            'overwrites the ACTIONS_* value, so the start operation stages the ' +
+            "CP's value as BMC_ACTIONS_RESULTS_URL — the runner must carry it.)");
     }
-    const runtimeToken = (env['ACTIONS_RUNTIME_TOKEN'] ?? '').trim();
+    const runtimeToken = (env['BMC_ACTIONS_RUNTIME_TOKEN'] ??
+        env['ACTIONS_RUNTIME_TOKEN'] ??
+        '').trim();
     if (runtimeToken === '') {
         throw new RunnerEnvError('ACTIONS_RUNTIME_TOKEN is not set: this runner job has no BMC runtime ' +
             'token staged, and the artifact protocol authenticates every call ' +
-            'with it.');
+            'with it. (GitHub\u2019s job message overwrites the ACTIONS_* value, ' +
+            'so the start operation stages the CP\u2019s token as ' +
+            'BMC_ACTIONS_RUNTIME_TOKEN — the runner must carry it.)');
     }
     const runId = parseRunId(env['GITHUB_RUN_ID'] ?? '');
     if (runId === null) {
