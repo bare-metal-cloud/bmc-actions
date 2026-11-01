@@ -43,17 +43,20 @@ inputs:
     description: >-
       Accepted for upstream compatibility and IGNORED (see github-token).
       A warning is emitted when this input is set to something other
-      than the current repository.
+      than the current repository. Leave unset: the current repository
+      is detected from the job environment (GITHUB_REPOSITORY) — a
+      composite action's input defaults cannot reference the github
+      context, so the default lives in the action's code, not here.
     required: false
-    default: ${{ github.repository }}
   run-id:
     description: >-
       The id of the workflow run where the desired artifact was uploaded
-      from. BMC artifacts are run-scoped: this must be the current run
-      (the default ${{ github.run_id }}); any other value fails the
-      action before any network call.
+      from. BMC artifacts are run-scoped: leave unset to target the
+      current run (auto-detected from GITHUB_RUN_ID — a composite
+      action's input defaults cannot reference the github context, so
+      the default lives in the action's code, not here); any other value
+      fails the action before any network call.
     required: false
-    default: ${{ github.run_id }}
 outputs:
   download-path:
     description: 'Path of artifact download'
