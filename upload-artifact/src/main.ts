@@ -12,22 +12,42 @@ import { readRunnerRuntime } from '../../shared/src/env'
 import { BmcArtifactClient } from '../../shared/src/client'
 import { findFilesToUpload, stageFiles } from '../../shared/src/search'
 import { uploadArtifact } from '../../shared/src/upload'
+import {
+  isS3Mode,
+  readS3Config,
+  S3ArtifactStore
+} from '../../shared/src/s3store'
 import { getInputs } from './inputs'
 
 export async function runUpload(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<void> {
   // 1. THE MARKER — the loud BMC-only refusal, before anything else.
-  assertBmcArtifactStore('upload-artifact', env)
+  // Direct object-store mode (s3-endpoint set) is the explicit opt-out:
+  // it talks to the bucket, never the BMC control plane.
+  const s3Mode = isS3Mode(core.getInput)
+  if (!s3Mode) assertBmcArtifactStore('upload-artifact', env)
 
   // 2. Inputs and the runner runtime (all before any network call).
   const inputs = getInputs()
-  const runtime = readRunnerRuntime(env)
-  const client = new BmcArtifactClient({
-    resultsUrl: runtime.resultsUrl,
-    runtimeToken: runtime.runtimeToken,
-    runId: runtime.runId
-  })
+  let client: BmcArtifactClient | null = null
+  let s3Store: S3ArtifactStore | null = null
+  if (s3Mode) {
+    const cfg = readS3Config(core.getInput)
+    core.setSecret(cfg.accessKeyId)
+    core.setSecret(cfg.secretAccessKey)
+    s3Store = new S3ArtifactStore(cfg, {
+      repository: env['GITHUB_REPOSITORY'] ?? '',
+      runId: env['GITHUB_RUN_ID'] ?? ''
+    })
+  } else {
+    const runtime = readRunnerRuntime(env)
+    client = new BmcArtifactClient({
+      resultsUrl: runtime.resultsUrl,
+      runtimeToken: runtime.runtimeToken,
+      runId: runtime.runId
+    })
+  }
 
   // 3. Search the workspace (the upstream search semantics).
   const search = await findFilesToUpload(
@@ -70,14 +90,27 @@ export async function runUpload(
 
   // 4. Upload: create → chunk PATCH → finalize (the protocol laws ride
   // in the shared orchestration).
-  const outcome = await uploadArtifact({
-    client,
-    artifactName: inputs.artifactName,
-    files: stageFiles(search.files, search.rootDirectory),
-    compressionLevel: inputs.compressionLevel,
-    overwrite: inputs.overwrite,
-    log: core
-  })
+  const files = stageFiles(search.files, search.rootDirectory)
+  let outcome: { artifactId: number | null; digest: string; size: number }
+  if (s3Store !== null) {
+    const manifest = await s3Store.upload(
+      inputs.artifactName,
+      files,
+      inputs.compressionLevel,
+      inputs.overwrite,
+      core
+    )
+    outcome = { artifactId: null, digest: manifest.digest, size: manifest.size }
+  } else {
+    outcome = await uploadArtifact({
+      client: client as BmcArtifactClient,
+      artifactName: inputs.artifactName,
+      files,
+      compressionLevel: inputs.compressionLevel,
+      overwrite: inputs.overwrite,
+      log: core
+    })
+  }
 
   core.info(
     `Artifact ${inputs.artifactName} has been successfully uploaded! ` +

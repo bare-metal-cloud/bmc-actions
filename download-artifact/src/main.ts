@@ -15,12 +15,21 @@ import { readRunnerRuntime } from '../../shared/src/env'
 import { BmcArtifactClient } from '../../shared/src/client'
 import { downloadArtifacts } from '../../shared/src/download'
 import { RunnerEnvError } from '../../shared/src/errors'
+import {
+  isS3Mode,
+  readS3Config,
+  S3ArtifactStore
+} from '../../shared/src/s3store'
+import { downloadFromS3 } from '../../shared/src/s3download'
 
 export async function runDownload(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<void> {
   // 1. THE MARKER — the loud BMC-only refusal, before anything else.
-  assertBmcArtifactStore('download-artifact', env)
+  // Direct object-store mode (s3-endpoint set) skips it: that mode
+  // talks to the bucket, never the BMC control plane.
+  const s3Mode = isS3Mode(core.getInput)
+  if (!s3Mode) assertBmcArtifactStore('download-artifact', env)
 
   // 2. Inputs (upstream grammar) — all resolved before any network call.
   const name = core.getInput('name')
@@ -44,6 +53,36 @@ export async function runDownload(
 
   const pattern = core.getInput('pattern')
   const mergeMultiple = core.getBooleanInput('merge-multiple')
+
+  if (s3Mode) {
+    if (artifactIdsInput.length > 0) {
+      throw new Error(
+        "the 'artifact-ids' input is not supported in direct object-store " +
+          "mode (s3-endpoint is set): select by 'name' or 'pattern'"
+      )
+    }
+    const cfg = readS3Config(core.getInput)
+    core.setSecret(cfg.accessKeyId)
+    core.setSecret(cfg.secretAccessKey)
+    // Direct mode is not run-bound by a token: repository and run-id may
+    // name another run (cross-run handoff), defaulting to the current one.
+    const store = new S3ArtifactStore(cfg, {
+      repository:
+        core.getInput('repository') || (env['GITHUB_REPOSITORY'] ?? ''),
+      runId: core.getInput('run-id') || (env['GITHUB_RUN_ID'] ?? '')
+    })
+    const s3Outcome = await downloadFromS3({
+      store,
+      name: name.length > 0 ? name : undefined,
+      pattern: pattern.length > 0 ? pattern : undefined,
+      destDir,
+      mergeMultiple,
+      log: core
+    })
+    core.setOutput('download-path', s3Outcome.downloadPath)
+    core.info('Download artifact has finished successfully')
+    return
+  }
 
   const githubToken = core.getInput('github-token')
   if (githubToken.length > 0) {
