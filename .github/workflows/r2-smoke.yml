@@ -1,0 +1,66 @@
+name: r2-smoke
+# Real-bucket check of the direct object-store mode (no fake): upload a
+# known tree, download it in a second job, compare bytes and digest.
+on:
+  pull_request:
+    paths:
+      - 'shared/**'
+      - 'upload-artifact/**'
+      - 'download-artifact/**'
+      - '.github/workflows/r2-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.up.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make a known tree
+        run: |
+          mkdir -p smoke/sub
+          head -c 3000000 /dev/urandom > smoke/random.bin
+          echo "hello r2 ${GITHUB_RUN_ID}" > smoke/sub/note.txt
+          (cd smoke && find . -type f | sort | xargs sha256sum) > smoke.sha256
+          cat smoke.sha256
+      - id: up
+        uses: ./upload-artifact
+        with:
+          name: r2-smoke
+          path: smoke/
+          s3-endpoint: ${{ vars.BMC_R2_ARTIFACTS_ENDPOINT }}
+          s3-bucket: ${{ vars.BMC_R2_ARTIFACTS_BUCKET }}
+          s3-access-key: ${{ secrets.BMC_R2_ARTIFACTS_KEY }}
+          s3-secret-key: ${{ secrets.BMC_R2_ARTIFACTS_SECRET }}
+      - name: Hand the expected checksums to the next job (inline, not via the store)
+        uses: actions/upload-artifact@v4
+        with:
+          name: expected
+          path: smoke.sha256
+          retention-days: 1
+
+  download:
+    needs: upload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./download-artifact
+        with:
+          name: r2-smoke
+          path: got/
+          s3-endpoint: ${{ vars.BMC_R2_ARTIFACTS_ENDPOINT }}
+          s3-bucket: ${{ vars.BMC_R2_ARTIFACTS_BUCKET }}
+          s3-access-key: ${{ secrets.BMC_R2_ARTIFACTS_KEY }}
+          s3-secret-key: ${{ secrets.BMC_R2_ARTIFACTS_SECRET }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: expected
+      - name: Bytes match
+        run: |
+          (cd got && find . -type f | sort | xargs sha256sum) | diff - smoke.sha256
+          echo "round trip through R2 matches"
+          echo "upload digest: ${{ needs.upload.outputs.digest }}"
