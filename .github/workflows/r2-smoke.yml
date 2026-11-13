@@ -15,18 +15,23 @@ permissions:
 
 jobs:
   upload:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-bmc
     outputs:
       digest: ${{ steps.up.outputs.artifact-digest }}
+      expected: ${{ steps.tree.outputs.expected }}
     steps:
       - uses: actions/checkout@v4
       - name: Make a known tree
+        id: tree
         run: |
           mkdir -p smoke/sub
           head -c 3000000 /dev/urandom > smoke/random.bin
           echo "hello r2 ${GITHUB_RUN_ID}" > smoke/sub/note.txt
           (cd smoke && find . -type f | sort | xargs sha256sum) > smoke.sha256
           cat smoke.sha256
+          # Small text handed to the next job as a job output (NOT via any
+          # artifact store: that quota is what this work replaces).
+          echo "expected=$(base64 -w0 smoke.sha256)" >> "$GITHUB_OUTPUT"
       - id: up
         uses: ./upload-artifact
         with:
@@ -36,16 +41,10 @@ jobs:
           s3-bucket: ${{ vars.BMC_R2_ARTIFACTS_BUCKET }}
           s3-access-key: ${{ secrets.BMC_R2_ARTIFACTS_KEY }}
           s3-secret-key: ${{ secrets.BMC_R2_ARTIFACTS_SECRET }}
-      - name: Hand the expected checksums to the next job (inline, not via the store)
-        uses: actions/upload-artifact@v4
-        with:
-          name: expected
-          path: smoke.sha256
-          retention-days: 1
 
   download:
     needs: upload
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-bmc
     steps:
       - uses: actions/checkout@v4
       - uses: ./download-artifact
@@ -56,11 +55,11 @@ jobs:
           s3-bucket: ${{ vars.BMC_R2_ARTIFACTS_BUCKET }}
           s3-access-key: ${{ secrets.BMC_R2_ARTIFACTS_KEY }}
           s3-secret-key: ${{ secrets.BMC_R2_ARTIFACTS_SECRET }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: expected
       - name: Bytes match
+        env:
+          EXPECTED: ${{ needs.upload.outputs.expected }}
         run: |
+          echo "$EXPECTED" | base64 -d > smoke.sha256
           (cd got && find . -type f | sort | xargs sha256sum) | diff - smoke.sha256
           echo "round trip through R2 matches"
           echo "upload digest: ${{ needs.upload.outputs.digest }}"
