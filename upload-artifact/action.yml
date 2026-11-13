@@ -52,6 +52,31 @@ inputs:
       If false, hidden files will be excluded from the artifact.
     default: 'false'
 
+  s3-endpoint:
+    description: >-
+      DIRECT OBJECT-STORE MODE (interim). When set, the action talks to this
+      S3-compatible endpoint (e.g. Cloudflare R2) instead of the BMC artifact
+      store, and works on any runner, GitHub-hosted included. The BMC-runner
+      marker is not required in this mode.
+    required: false
+  s3-bucket:
+    description: 'Bucket name (direct object-store mode).'
+    required: false
+  s3-access-key:
+    description: 'Access key id (direct object-store mode). Pass a secret.'
+    required: false
+  s3-secret-key:
+    description: 'Secret access key (direct object-store mode). Pass a secret.'
+    required: false
+  s3-region:
+    description: 'Signing region (direct object-store mode). R2 uses auto.'
+    required: false
+    default: 'auto'
+  s3-prefix:
+    description: 'Key prefix inside the bucket (direct object-store mode).'
+    required: false
+    default: 'ci'
+
 outputs:
   artifact-id:
     description: >

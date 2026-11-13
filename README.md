@@ -46,6 +46,47 @@ Cross-job downloads work: artifacts are stored per RUN, and any job of
 the run can download an earlier job's artifact (the v4 semantics —
 job2 downloads job1's artifact).
 
+## Direct object-store mode (interim)
+
+While the BMC artifact store is not live, both actions can talk straight
+to an S3-compatible bucket (Cloudflare R2). Set `s3-endpoint` and the
+action skips the BMC marker and the control plane entirely, so it works
+on **any** runner, GitHub-hosted included:
+
+```yaml
+- uses: bare-metal-cloud/bmc-actions/upload-artifact@<ref>
+  with:
+    name: build-output
+    path: dist/
+    s3-endpoint: ${{ vars.BMC_R2_ARTIFACTS_ENDPOINT }}
+    s3-bucket: ${{ vars.BMC_R2_ARTIFACTS_BUCKET }}
+    s3-access-key: ${{ secrets.BMC_R2_ARTIFACTS_KEY }}
+    s3-secret-key: ${{ secrets.BMC_R2_ARTIFACTS_SECRET }}
+- uses: bare-metal-cloud/bmc-actions/download-artifact@<ref>
+  with:
+    name: build-output
+    path: out/
+    s3-endpoint: ${{ vars.BMC_R2_ARTIFACTS_ENDPOINT }}
+    s3-bucket: ${{ vars.BMC_R2_ARTIFACTS_BUCKET }}
+    s3-access-key: ${{ secrets.BMC_R2_ARTIFACTS_KEY }}
+    s3-secret-key: ${{ secrets.BMC_R2_ARTIFACTS_SECRET }}
+```
+
+- Objects: `<s3-prefix>/<owner>/<repo>/<runId>/<name>/artifact.tgz` plus a
+  `manifest.json` written LAST (the commit marker; it carries the SHA-256).
+  The archive is the same deterministic tar.gz as the BMC path.
+- Uploads over 32 MiB use multipart. Downloads verify the SHA-256 and
+  FAIL (extracting nothing) on a mismatch.
+- `download-artifact` also accepts `repository` and `run-id` here, so a
+  later run can read an earlier run's artifact. `artifact-ids` is not
+  supported in this mode (use `name` or `pattern`).
+- `retention-days` has no effect: configure a lifecycle rule on the
+  `<s3-prefix>/` prefix in the bucket.
+- Secrets are empty on pull requests from forks; the action then fails
+  naming the missing inputs, before any network call.
+- Not for production-grade isolation: anyone who can read the bucket
+  credentials can read every artifact. Keep the bucket private.
+
 ## The protocol
 
 Everything rides the control-plane base `ACTIONS_RESULTS_URL` (in v1

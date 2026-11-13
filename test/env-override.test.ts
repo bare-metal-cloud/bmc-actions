@@ -17,7 +17,8 @@ describe('readRunnerRuntime BMC-name preference', () => {
   it('prefers BMC_ACTIONS_RESULTS_URL over the overridden ACTIONS_RESULTS_URL', () => {
     const rt = readRunnerRuntime({
       ...RUN,
-      ACTIONS_RESULTS_URL: 'https://results-receiver.actions.githubusercontent.com',
+      ACTIONS_RESULTS_URL:
+        'https://results-receiver.actions.githubusercontent.com',
       BMC_ACTIONS_RESULTS_URL: 'https://cp.example.test/api/v1/runner-runtime',
       ACTIONS_RUNTIME_TOKEN: 'github-token',
       BMC_ACTIONS_RUNTIME_TOKEN: 'bmc-token'

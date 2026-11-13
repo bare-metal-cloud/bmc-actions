@@ -151,7 +151,7 @@ export async function downloadArtifacts(
  * client-side guard is what keeps a hostile name from writing outside
  * `path`.)
  */
-function assertSafeArtifactName(name: string): void {
+export function assertSafeArtifactName(name: string): void {
   if (name.startsWith('/') || name.includes('\\')) {
     throw new Error(
       `refusing to extract the artifact '${name}': its name is not a safe ` +
@@ -167,7 +167,7 @@ function assertSafeArtifactName(name: string): void {
 }
 
 /** Belt and braces: the resolved extraction root must stay under destDir. */
-function assertExtractionRootUnderDestination(
+export function assertExtractionRootUnderDestination(
   destDir: string,
   target: string
 ): void {
