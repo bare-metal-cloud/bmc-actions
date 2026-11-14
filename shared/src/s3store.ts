@@ -13,6 +13,7 @@
  */
 
 import * as crypto from 'crypto'
+import * as fs from 'fs'
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
@@ -55,6 +56,42 @@ export interface S3Manifest {
   createdAt: string
 }
 
+/**
+ * Reads `s3-access-key=...` / `s3-secret-key=...` lines (blank lines and
+ * # comments ignored) from a sealed credentials file. The file must not be
+ * group/other accessible: a 0600 seal is the contract, and a looser mode
+ * means something upstream did not seal it.
+ */
+export function readCredentialsFile(path: string): {
+  accessKeyId: string
+  secretAccessKey: string
+} {
+  let st: fs.Stats
+  try {
+    st = fs.statSync(path)
+  } catch {
+    throw new BmcArtifactError(
+      `s3-credentials-file '${path}' does not exist (the seal step must run first)`
+    )
+  }
+  if (process.platform !== 'win32' && (st.mode & 0o077) !== 0) {
+    throw new BmcArtifactError(
+      `s3-credentials-file '${path}' is accessible to group/other (mode ${(st.mode & 0o777).toString(8)}); it must be 0600`
+    )
+  }
+  const kv = new Map<string, string>()
+  for (const raw of fs.readFileSync(path, 'utf8').split(/\r?\n/)) {
+    const line = raw.trim()
+    if (line === '' || line.startsWith('#')) continue
+    const i = line.indexOf('=')
+    if (i > 0) kv.set(line.slice(0, i).trim(), line.slice(i + 1).trim())
+  }
+  return {
+    accessKeyId: kv.get('s3-access-key') ?? '',
+    secretAccessKey: kv.get('s3-secret-key') ?? ''
+  }
+}
+
 /** True when the workflow asked for direct object-store mode. */
 export function isS3Mode(getInput: (name: string) => string): boolean {
   return getInput('s3-endpoint').trim().length > 0
@@ -68,8 +105,19 @@ export function isS3Mode(getInput: (name: string) => string): boolean {
 export function readS3Config(getInput: (name: string) => string): S3Config {
   const endpoint = getInput('s3-endpoint').trim()
   const bucket = getInput('s3-bucket').trim()
-  const accessKeyId = getInput('s3-access-key').trim()
-  const secretAccessKey = getInput('s3-secret-key').trim()
+  let accessKeyId = getInput('s3-access-key').trim()
+  let secretAccessKey = getInput('s3-secret-key').trim()
+  const credsFile = getInput('s3-credentials-file').trim()
+  if (credsFile !== '') {
+    // A sealed file keeps the values out of every step's input env (the
+    // drill framework's SEC-SC-06 law): the workflow passes a PATH only.
+    if (accessKeyId !== '' || secretAccessKey !== '') {
+      throw new BmcArtifactError(
+        's3-credentials-file cannot be combined with s3-access-key / s3-secret-key: pass one or the other'
+      )
+    }
+    ;({ accessKeyId, secretAccessKey } = readCredentialsFile(credsFile))
+  }
   const missing = [
     ['s3-bucket', bucket],
     ['s3-access-key', accessKeyId],

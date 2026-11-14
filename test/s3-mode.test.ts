@@ -220,6 +220,86 @@ describe('direct object-store mode', () => {
     expect(s3.requests).toHaveLength(0)
   })
 
+  describe('s3-credentials-file (sealed credentials)', () => {
+    const credFile = (mode: number, body?: string): string => {
+      const f = path.join(ws, 'evidence-store')
+      fs.writeFileSync(
+        f,
+        body ??
+          '# sealed\ns3-access-key=AKIAFILE\ns3-secret-key=filesecretfilesecret\n',
+        { mode }
+      )
+      fs.chmodSync(f, mode)
+      return f
+    }
+    const noInline = { 's3-access-key': '', 's3-secret-key': '' }
+
+    it('uploads and downloads using a 0600 file, no inline secrets', async () => {
+      write('a.txt', 'sealed')
+      const f = credFile(0o600)
+      const up = await upload({
+        ...noInline,
+        's3-credentials-file': f,
+        name: 'ev',
+        path: path.join(ws, 'src')
+      })
+      expect(up.error).toBeNull()
+      const out = path.join(ws, 'out')
+      const dl = await download({
+        ...noInline,
+        's3-credentials-file': f,
+        name: 'ev',
+        path: out
+      })
+      expect(dl.error).toBeNull()
+      expect(fs.readFileSync(path.join(out, 'a.txt'), 'utf8')).toBe('sealed')
+    })
+
+    it('refuses a file that is group/other readable', async () => {
+      write('a.txt', 'x')
+      const r = await upload({
+        ...noInline,
+        's3-credentials-file': credFile(0o644),
+        name: 'ev',
+        path: path.join(ws, 'src')
+      })
+      expect(r.error?.message).toMatch(/must be 0600/)
+      expect(s3.requests).toHaveLength(0)
+    })
+
+    it('refuses a missing file, a half-filled file, and file + inline together', async () => {
+      write('a.txt', 'x')
+      const base = { name: 'ev', path: path.join(ws, 'src') }
+      expect(
+        (
+          await upload({
+            ...base,
+            ...noInline,
+            's3-credentials-file': path.join(ws, 'nope')
+          })
+        ).error?.message
+      ).toMatch(/does not exist/)
+      expect(
+        (
+          await upload({
+            ...base,
+            ...noInline,
+            's3-credentials-file': credFile(0o600, 's3-access-key=only\n')
+          })
+        ).error?.message
+      ).toMatch(/missing: s3-secret-key/)
+      expect(
+        (
+          await upload({
+            ...base,
+            's3-credentials-file': credFile(0o600)
+          })
+        ).error?.message
+      ).toMatch(/cannot be combined/)
+      expect(s3.requests).toHaveLength(0)
+    })
+  })
+
   it('without s3-endpoint the BMC marker law still refuses first', async () => {
     const sandbox = withActionEnv(
       { name: 'a', path: ws },

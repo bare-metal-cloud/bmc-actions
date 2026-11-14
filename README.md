@@ -84,6 +84,12 @@ on **any** runner, GitHub-hosted included:
   `<s3-prefix>/` prefix in the bucket.
 - Secrets are empty on pull requests from forks; the action then fails
   naming the missing inputs, before any network call.
+- `s3-credentials-file` (instead of `s3-access-key` / `s3-secret-key`): a path
+  to a file with `s3-access-key=...` and `s3-secret-key=...` lines. It must be
+  mode 0600 (anything group/other-readable is refused) and cannot be combined
+  with the inline inputs. Use it where credentials must not appear in any
+  step's inputs, e.g. workflows with a sealed-secrets rule: a seal step writes
+  the file, and the upload step passes only its path.
 - Not for production-grade isolation: anyone who can read the bucket
   credentials can read every artifact. Keep the bucket private.
 
