@@ -68,6 +68,12 @@ inputs:
   s3-secret-key:
     description: 'Secret access key (direct object-store mode). Pass a secret.'
     required: false
+  s3-credentials-file:
+    description: >-
+      Path to a 0600 file with `s3-access-key=...` and `s3-secret-key=...` lines
+      (direct object-store mode). Use instead of the two inputs above when the
+      credentials must not appear in any step's inputs (sealed-secret workflows).
+    required: false
   s3-region:
     description: 'Signing region (direct object-store mode). R2 uses auto.'
     required: false
